@@ -1,0 +1,289 @@
+---
+title: "Machine Learning Course Project"
+author: "Har Yash Bahadur"
+date: "Saturday, June 20, 2015"
+output: html_document
+---
+
+##Introduction
+
+This report analyses the data from wearables devices, used by several volunteers while doing various kinds of exercises and it attempts to predict the manner in which the exercise was conducted. The data is explored, cleaned and then suitable models are trained and evaluated. The model finally selected is used for predicting how well an exercise was done.
+
+##Background of Data
+
+The data for this project come from the source: http://groupware.les.inf.puc-rio.br/har. The outcome is the variable *classe* and the rest variables are potential *predictors*. The variables capture the data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways.  Apart from this, there are variables identifying the user and some variables related to time windows.
+
+
+
+```{r, echo=FALSE,message=FALSE,warning=FALSE}
+library(caret)
+library(randomForest)
+library(rpart)
+library(gbm)
+library(splines)
+library(survival)
+library(doParallel)
+cl <- makeCluster(detectCores())
+# registerDoParallel(cl, cores = (detectCores())/2)
+# set.seed(13234)
+```
+
+
+##Getting and Cleaning Data
+
+```{r}
+trainBase <- read.csv("pml-training.csv")
+dim(trainBase)
+```
+
+The data is read from the csv file. It has `r dim(trainBase)[1]` observations and `r dim(trainBase)[2]` variables. The outcome is a factor variable with five levels. 
+
+- Since the first seven columns are related to user identity and time windows, and do not characterize the exercise in any way, we shall remove them. 
+- We shall  remove columns which have many NA fields. 
+- We shall also remove columns which are largely blanks. 
+
+###Removing identity variables and NAs
+```{r}
+trainingSet <- trainBase[,-c(1:7)]
+rm(trainBase)  ### No longer needed
+
+naRemoveThreshold <- .9
+i=1; count=1
+delcol <- vector()
+for (i in (1:length(names(trainingSet)))) {
+#   print(i)
+  naRatio <- length(which(is.na(trainingSet[,i])))/(dim(trainingSet)[1])
+#   print("naRatio"); print(naRatio)
+  if (naRatio >= naRemoveThreshold){
+    #mark column to be deleted
+    delcol[count] <- i
+#     print("####")
+#     print(count); print(names(trainingSet)[i])
+#     print("####")
+    count <- count + 1
+  }
+}
+trainingSet <- trainingSet[, -delcol]
+dim(trainingSet)
+```
+
+As we can see, there are `r dim(trainingSet)[2]` variables after removal of columns having NAs. There were `r (count-1)` variables that had NAs and the ratio of NA observations was a staggering 97%.
+
+###Removing blank columns
+
+Further exploration shows that there are variables which have "#DIV/0!" as entries. These variables have huge factor levels, which is an artifact of the read.csv function. The proportion of blanks("") in these variables is very high and thus, they shall be removed as well.
+
+```{r}
+
+i=1; count=1
+delcol3 <- vector()
+for (i in (1:length(names(trainingSet)))) {
+#   print(i)
+  
+  if (length(levels(trainingSet[,i])) != 0) { ## it is a factor variable
+      lengthSpace <- length(which((trainingSet[,i] == ""))) 
+   if (lengthSpace > 10000) {  ### There are more than 10000 blank entries out of 19622
+	   delcol3[count] <- i
+# 	   print("####")
+#        print(count); print(names(trainingSet)[i])
+#        print("####")
+       count <- count + 1
+	 }
+  }
+}
+
+## Removing all cols which have ""
+trainingSet <- trainingSet[, -delcol3]
+dim(trainingSet)
+```
+
+As we can see, there are `r dim(trainingSet)[2]` variables after removal of columns having blanks. There were `r (count-1)` variables that had a high proportion iof blanks.
+
+Now the dataset is ready for model fitting.
+
+##Partition Data: Model Validation Strategy
+
+Since there are very large number of observations, the following strategy shall be pursued for model evaluation and validation: 
+- Split training set into three sets - one for building and training models (**trainingSetforModelBuild_subset**), next for evaluating various models (** cvSetforModelBuild_subset**) and helping selecting the final model, and the last for estimating the out of sample accuracy (**trainingSetforHoldoutCV**) of the final model. 
+- The split should be 60%, 20% and 20% in order as specified above. 
+
+All the models which are trained using *trainingSetforModelBuild_subset* must be evaluated using *cvSetforModelBuild_subset*, which is thus a way of doing split-validation.  The one which gives the best accuracy is chosen. 
+
+```{r}
+intrain <- createDataPartition(y=trainingSet$classe, p=0.8, list=FALSE)
+trainingSetforModelBuild <- trainingSet[intrain, ]
+trainingSetforHoldoutCV <- trainingSet[-intrain, ]
+
+## Split train data into trainsubset and cvsubset
+intraintrain <- createDataPartition(y=trainingSetforModelBuild$classe, p=0.75, list=FALSE)
+trainingSetforModelBuild_subset <- trainingSetforModelBuild[intraintrain,] ## smaller set
+cvSetforModelBuild_subset <- trainingSetforModelBuild[-intraintrain,] ## smaller set
+rm(trainingSet)  ## no longer needed
+```
+
+Any cross-validation techniques employed during training and fitting a model are applied within *trainingSetforModelBuild_subset*, implicitly by the train function.
+
+##Model Fitting
+
+Since the outcome variables *classe* is a factor variable, it is a classification problem. From the data, it is evident that it is not a counting problem, so, GLMs sjall not to be used. Also, linear regression is not suitable for a problem with so many variables and they also have interpretability problems.
+
+So, the decision trees and their variants shall be the preferred models for training the dataset.
+
+The 53 predictors are all either numeric or integer. Let us assume that are all important predictors.
+
+### Out of Sample Error Rate / Accuracy Desired
+
+At the outset, the OOS accuracy desired shall be > 95% and the model selection shall be done in a manner to achieve this.
+
+### Classification trees.
+
+The first model that shall be tried is the plain vanilla decision tree/classification tree, and the correspoding method is *rpart*. For internal cross validation we shall use *repeatedcv* with k=10 folds.
+
+```{r}
+set.seed(13234)
+trctrlCART1 <- trainControl(method="repeatedcv", number=10, repeats=1)
+fitCART1 <- train(x=trainingSetforModelBuild_subset[,-53], y=trainingSetforModelBuild_subset[,53], method="rpart", trControl=trctrlCART1)
+  predCART1 <- predict(fitCART1, newdata=cvSetforModelBuild_subset)
+cmCART1 <- confusionMatrix(predCART1, cvSetforModelBuild_subset$classe)
+cmCART1
+```
+
+From the confusion matrix results, it is clear that the accuracy that we get is `r cmCART1[[3]][1]`, which is very poor. To improve this, we increase the tuneLength parameter of the train function.
+
+```{r}
+set.seed(13234)
+fitCART1 <- train(x=trainingSetforModelBuild_subset[,-53], y=trainingSetforModelBuild_subset[,53], method="rpart", trControl=trctrlCART1, tuneLength=10)
+fitCART1 <- train(x=trainingSetforModelBuild_subset[,-53], y=trainingSetforModelBuild_subset[,53], method="rpart", trControl=trctrlCART1)
+  predCART1 <- predict(fitCART1, newdata=cvSetforModelBuild_subset)
+cmCART1 <- confusionMatrix(predCART1, cvSetforModelBuild_subset$classe)
+cmCART1
+```
+
+Now the accuracy is `r cmCART1[[3]][1]`, which is slightly better, but still much smaller than the objective of 95%.
+
+So, we shall now try the other models.
+
+### Random Forests
+
+The next model to be tried is Random Forests. It is supposed to give better results than decision trees. The internal cross-validation technique employed is *repeatedcv* with k=10 folds. The rest of the parameters are default values.
+
+
+```{r}
+set.seed(13234)
+trctrlRF3 <- trainControl(method="repeatedcv", number=10, repeats=1)
+fit1trainRF3 <- train(x=trainingSetforModelBuild_subset[,-53], y=trainingSetforModelBuild_subset[,53], method="rf", ntree=500, trControl=trctrlRF3)
+predtrainRF3 <- predict(fit1trainRF3, newdata=cvSetforModelBuild_subset)
+cmRF3 <- confusionMatrix(predtrainRF3, cvSetforModelBuild_subset$classe)
+cmRF3
+```
+
+The accuracy is now `r cmRF3[[3]][1]` has greatly improved.
+
+If we plot the model, we see the accuracy as a function of the number of random predictors (mtry).
+```{r}
+ggplot(fit1trainRF3)
+```
+
+We can try random forests for a different set of tuning parametrs than the default. The optimum value of mtry = sqrt(number fo predictors).
+
+Since num_predictors = 52, and sqrt(52) = `r sqrt(52)`, we will try both floor and ceiling.
+
+```{r}
+set.seed(13234)
+trctrlRF4 <- trainControl(method="repeatedcv", number=10, repeats=1)
+rfGrid <- data.frame(mtry=c(2,7,8,27))
+fit1trainRF4 <- train(x=trainingSetforModelBuild_subset[,-53], y=trainingSetforModelBuild_subset[,53], method="rf", ntree=500, trControl=trctrlRF4, tuneGrid=rfGrid)
+predtrainRF4 <- predict(fit1trainRF4, newdata=cvSetforModelBuild_subset)
+cmRF4 <- confusionMatrix(predtrainRF4, cvSetforModelBuild_subset$classe)
+cmRF4
+```
+
+The accuracy is now `r cmRF3[[3]][1]` has improved slightly.
+
+The model plot shows how the optimum value of parameter mtry is arrived at. 
+```{r}
+ggplot(fit1trainRF4)
+```
+
+By using the random forests, we have been able to achieve the target accuracy of > 95%. 
+
+We need to ensure that we are not overfitting, and hence we shall try a different model for comparison.
+
+### Boosting
+
+The last model that we shall employ is boosting with trees. The cross validation method remains the same - repeatedcv with k=10 folds.
+
+```{r}
+# set.seed(13234)
+# trctrlGBM1 <- trainControl(method="repeatedcv", number=10, repeats=1)
+# fitGBM1 <- train(x=trainingSetforModelBuild_subset[,-53], y=trainingSetforModelBuild_subset[,53], method="gbm", trControl=trctrlGBM1)
+# predGBM1 <- predict(fitGBM1, cvSetforModelBuild_subset[,-53])  ### Gives error unless outcome col is removed
+# cmGBM1 <- confusionMatrix(predGBM1, cvSetforModelBuild_subset$classe)
+# cmGBM1
+```
+
+Note: Due to runtime memory problems while knitting, I have commented the code for gbm model here, but ran it seperately. The accuracy has decreased by about 4% when measured on the split-validation set. It is ~ 95%.
+
+We shall try GBM with more tuning parameters.
+```{r}
+# set.seed(13234)
+# tuneGBM = data.frame(shrinkage = (0.1),n.minobsinnode=10, n.trees=c(200, 300, 400, 500), interaction.depth=5)
+# fitGBM1 <- train(x=trainingSetforModelBuild_subset[,-53], y=trainingSetforModelBuild_subset[,53], method="gbm", trControl=trctrlGBM1)
+# predGBM1 <- predict(fitGBM1, cvSetforModelBuild_subset[,-53])  ### Gives error unless outcome col is removed
+# cmGBM1 <- confusionMatrix(predGBM1, cvSetforModelBuild_subset$classe)
+# cmGBM1
+```
+
+Note: Due to runtime memory problems while knitting, I have commented the code for gbm model here, but ran it seperately. The accuracy increased to ~99% when increasing number of trees to 500 and intercation depth to 5. This accuracy is comparable to what we got from using Random forests.
+
+##Final Model Selection
+
+Since both Random Forests and Boosting give similar accuracy, but random forests are faster to execute *we shall select random forest model as the final model with tuning parameters ntree=500 and mtry=8*.
+We shall run it once on the hold out test set, to estimate the out of sample accuracy.
+
+```{r}
+predRF411 <- predict(fit1trainRF4, newdata=trainingSetforHoldoutCV)
+cmRF411 <- confusionMatrix(predRF411, trainingSetforHoldoutCV$classe)
+```
+
+The estimate for out of sample accuarcy is `r cmRF411[[3]][1]`.
+
+This model shall be applied on the test sets.
+
+##Predicting on test set
+
+The test data is read and cleaned for NA values.
+
+```{r}
+testBase <- read.csv("pml-testing.csv")
+dim(testBase)
+
+naRemoveThreshold <- .5
+i=1; count=1
+delcol <- vector()
+for (i in (1:length(names(testBase)))) {
+#   print(i)
+  naRatio <- length(which(is.na(testBase[,i])))/(dim(testBase)[1])
+#   print("naRatio"); print(naRatio)
+  if (naRatio >= naRemoveThreshold){
+    #mark column to be deleted
+    delcol[count] <- i
+#     print("####")
+#     print(count); print(names(testBase)[i])
+#     print("####")
+    count <- count + 1
+  }
+}
+testBase <- testBase[, -delcol]
+dim(testBase)
+```
+
+
+Now the trained Random Forest model is applied to the test data to get the predicted values.
+
+```{r}
+predtestRF4 <- predict(fit1trainRF4, testBase)
+predtestRF4
+```
+
+###                      End of Report 
